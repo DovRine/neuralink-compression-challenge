@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 	"unsafe"
 )
 
@@ -16,7 +17,8 @@ type HuffmanNode struct {
 	freq     int
 	left     *HuffmanNode
 	right    *HuffmanNode
-	code     string
+	code     uint64
+	codeLen  uint8
 	index    int
 }
 
@@ -60,38 +62,58 @@ func buildHuffmanTree(freqMap map[int]int) *HuffmanNode {
 	return heap.Pop(h).(*HuffmanNode)
 }
 
-func generateHuffmanCodes(node *HuffmanNode, code string, codeMap map[int]string) {
+func generateHuffmanCodes(node *HuffmanNode, code uint64, codeLen uint8, codeMap map[int]*HuffmanNode) {
 	if node == nil {
 		return
 	}
 	if node.left == nil && node.right == nil {
 		node.code = code
-		codeMap[node.value] = code
+		node.codeLen = codeLen
+		codeMap[node.value] = node
 	}
-	generateHuffmanCodes(node.left, code+"0", codeMap)
-	generateHuffmanCodes(node.right, code+"1", codeMap)
+	generateHuffmanCodes(node.left, code<<1, codeLen+1, codeMap)
+	generateHuffmanCodes(node.right, (code<<1)|1, codeLen+1, codeMap)
 }
 
-func encodeData(data []int, codeMap map[int]string) string {
-	encoded := ""
+func encodeData(data []int, codeMap map[int]*HuffmanNode) []byte {
+	buf := make([]byte, (len(data)*8+7)/8)
+	var bitPos uint8
+	var bytePos int
 	for _, value := range data {
-		encoded += codeMap[value]
+		node := codeMap[value]
+		for i := node.codeLen; i > 0; i-- {
+			if (node.code>>(i-1))&1 == 1 {
+				buf[bytePos] |= 1 << (7 - bitPos)
+			}
+			bitPos++
+			if bitPos == 8 {
+				bitPos = 0
+				bytePos++
+			}
+		}
 	}
-	return encoded
+	return buf
 }
 
-func decodeData(encoded string, root *HuffmanNode) []int {
+func decodeData(encoded []byte, root *HuffmanNode, totalBits int) []int {
 	node := root
-	decoded := []int{}
-	for _, bit := range encoded {
-		if bit == '0' {
-			node = node.left
-		} else {
-			node = node.right
-		}
-		if node.left == nil && node.right == nil {
-			decoded = append(decoded, node.value)
-			node = root
+	decoded := make([]int, 0, totalBits/8)
+	bitCount := 0
+	for _, b := range encoded {
+		for i := 0; i < 8; i++ {
+			if bitCount >= totalBits {
+				return decoded
+			}
+			if (b>>(7-i))&1 == 0 {
+				node = node.left
+			} else {
+				node = node.right
+			}
+			if node.left == nil && node.right == nil {
+				decoded = append(decoded, node.value)
+				node = root
+			}
+			bitCount++
 		}
 	}
 	return decoded
@@ -227,7 +249,7 @@ func parseWAVHeader(data []byte) (uint16, uint16, uint32, uint32, []byte, error)
 }
 
 func convertAudioToTuples(numChannels uint16, bitsPerSample uint16, audioData []byte) [][2]int {
-	var tuples [][2]int
+	tuples := make([][2]int, len(audioData)/(int(numChannels)*(int(bitsPerSample)/8)))
 
 	sampleSize := int(bitsPerSample / 8)
 	numSamples := len(audioData) / (int(numChannels) * sampleSize)
@@ -248,13 +270,9 @@ func convertAudioToTuples(numChannels uint16, bitsPerSample uint16, audioData []
 
 			// Assuming first channel is frequency and second channel is amplitude
 			if ch == 0 {
-				tuple := [2]int{value, 0}
-				if len(tuples) > 0 {
-					tuple[1] = tuples[len(tuples)-1][1]
-				}
-				tuples = append(tuples, tuple)
+				tuples[i][0] = value
 			} else if ch == 1 {
-				tuples[len(tuples)-1][1] = value
+				tuples[i][1] = value
 			}
 		}
 	}
@@ -299,9 +317,10 @@ func main() {
 	encodedTuples := DeltaEncode(tuples)
 
 	// Flatten the tuples for Huffman encoding
-	var flattenedData []int
-	for _, tuple := range encodedTuples {
-		flattenedData = append(flattenedData, tuple[0], tuple[1])
+	flattenedData := make([]int, len(encodedTuples)*2)
+	for i, tuple := range encodedTuples {
+		flattenedData[i*2] = tuple[0]
+		flattenedData[i*2+1] = tuple[1]
 	}
 
 	// Calculate frequency map
@@ -314,36 +333,44 @@ func main() {
 	huffmanRoot := buildHuffmanTree(freqMap)
 
 	// Generate Huffman codes
-	codeMap := make(map[int]string)
-	generateHuffmanCodes(huffmanRoot, "", codeMap)
+	codeMap := make(map[int]*HuffmanNode)
+	generateHuffmanCodes(huffmanRoot, 0, 0, codeMap)
 
+	// Measure encoding time
+	startEncoding := time.Now()
 	// Encode data using Huffman codes
-	encodedString := encodeData(flattenedData, codeMap)
+	encodedData := encodeData(flattenedData, codeMap)
+	encodingTime := time.Since(startEncoding)
 
 	// Calculate packed size in bytes
-	packedSize := (len(encodedString) + 7) / 8 // bits to bytes
+	packedSize := len(encodedData)
 
-	// Calculate compression ratio
-	compressionRatio := float64(originalSize) / float64(packedSize)
-
+	// Measure decoding time
+	startDecoding := time.Now()
 	// Decode data back to original form
-	decodedFlattenedData := decodeData(encodedString, huffmanRoot)
+	decodedFlattenedData := decodeData(encodedData, huffmanRoot, len(flattenedData)*8)
+	decodingTime := time.Since(startDecoding)
 
 	// Reconstruct tuples from flattened data
-	var unpackedEncodedData [][2]int
-	for i := 0; i < len(decodedFlattenedData); i += 2 {
-		unpackedEncodedData = append(unpackedEncodedData, [2]int{decodedFlattenedData[i], decodedFlattenedData[i+1]})
+	unpackedEncodedData := make([][2]int, len(decodedFlattenedData)/2)
+	for i := range unpackedEncodedData {
+		unpackedEncodedData[i][0] = decodedFlattenedData[i*2]
+		unpackedEncodedData[i][1] = decodedFlattenedData[i*2+1]
 	}
 
 	// Delta decode tuples
 	unpackedData := DeltaDecode(unpackedEncodedData)
 	_ = unpackedData
 
+	// Calculate compression ratio
+	compressionRatio := float64(originalSize) / float64(packedSize)
+
 	// Print results
 	// fmt.Println("Original:", tuples)
 	fmt.Printf("Original size: %d bytes\n", originalSize)
 	// fmt.Println("Encoded:", encodedTuples)
-	fmt.Println("Huffman Encoded String Length:", len(encodedString))
 	fmt.Printf("Packed size: %d bytes (Compression ratio: %.2f)\n", packedSize, compressionRatio)
+	fmt.Printf("Encoding time: %s\n", encodingTime)
+	fmt.Printf("Decoding time: %s\n", decodingTime)
 	// fmt.Println("Unpacked:", unpackedData)
 }
