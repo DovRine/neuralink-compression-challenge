@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
+	"encoding/binary"
 	"fmt"
+	"io"
+	"os"
 	"unsafe"
 )
 
+// Huffman coding structures and functions
 type HuffmanNode struct {
 	value    int
 	freq     int
@@ -92,7 +97,7 @@ func decodeData(encoded string, root *HuffmanNode) []int {
 	return decoded
 }
 
-// DeltaEncode converts a list of tuples to a list of delta-encoded tuples.
+// Delta encoding functions
 func DeltaEncode(tuples [][2]int) [][2]int {
 	if len(tuples) == 0 {
 		return nil
@@ -106,7 +111,6 @@ func DeltaEncode(tuples [][2]int) [][2]int {
 	return encoded
 }
 
-// DeltaDecode converts a list of delta-encoded tuples back to the original list of tuples.
 func DeltaDecode(encoded [][2]int) [][2]int {
 	if len(encoded) == 0 {
 		return nil
@@ -120,9 +124,173 @@ func DeltaDecode(encoded [][2]int) [][2]int {
 	return tuples
 }
 
+// WAV file parsing functions
+func readWAVFile(filePath string) ([]byte, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var data []byte
+	buffer := make([]byte, 1024)
+	for {
+		n, err := file.Read(buffer)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
+		if n == 0 {
+			break
+		}
+		data = append(data, buffer[:n]...)
+	}
+	return data, nil
+}
+
+func parseWAVHeader(data []byte) (uint16, uint16, uint32, uint32, []byte, error) {
+	reader := bytes.NewReader(data)
+
+	var chunkID [4]byte
+	var chunkSize uint32
+	var format [4]byte
+
+	var subchunk1ID [4]byte
+	var subchunk1Size uint32
+	var audioFormat uint16
+	var numChannels uint16
+	var sampleRate uint32
+	var byteRate uint32
+	var blockAlign uint16
+	var bitsPerSample uint16
+
+	var subchunk2ID [4]byte
+	var subchunk2Size uint32
+
+	if err := binary.Read(reader, binary.LittleEndian, &chunkID); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &chunkSize); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &format); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &subchunk1ID); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &subchunk1Size); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &audioFormat); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &numChannels); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &sampleRate); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &byteRate); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &blockAlign); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+	if err := binary.Read(reader, binary.LittleEndian, &bitsPerSample); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+
+	for {
+		if err := binary.Read(reader, binary.LittleEndian, &subchunk2ID); err != nil {
+			return 0, 0, 0, 0, nil, err
+		}
+		if err := binary.Read(reader, binary.LittleEndian, &subchunk2Size); err != nil {
+			return 0, 0, 0, 0, nil, err
+		}
+
+		if string(subchunk2ID[:4]) == "data" {
+			break
+		} else {
+			// Skip unknown chunk
+			if _, err := reader.Seek(int64(subchunk2Size), 1); err != nil {
+				return 0, 0, 0, 0, nil, err
+			}
+		}
+	}
+
+	audioData := make([]byte, subchunk2Size)
+	if err := binary.Read(reader, binary.LittleEndian, &audioData); err != nil {
+		return 0, 0, 0, 0, nil, err
+	}
+
+	return numChannels, bitsPerSample, sampleRate, subchunk2Size, audioData, nil
+}
+
+func convertAudioToTuples(numChannels uint16, bitsPerSample uint16, audioData []byte) [][2]int {
+	var tuples [][2]int
+
+	sampleSize := int(bitsPerSample / 8)
+	numSamples := len(audioData) / (int(numChannels) * sampleSize)
+
+	for i := 0; i < numSamples; i++ {
+		for ch := 0; ch < int(numChannels); ch++ {
+			offset := (i*int(numChannels) + ch) * sampleSize
+			var value int
+
+			switch sampleSize {
+			case 1:
+				value = int(audioData[offset])
+			case 2:
+				value = int(int16(binary.LittleEndian.Uint16(audioData[offset:])))
+			case 4:
+				value = int(int32(binary.LittleEndian.Uint32(audioData[offset:])))
+			}
+
+			// Assuming first channel is frequency and second channel is amplitude
+			if ch == 0 {
+				tuple := [2]int{value, 0}
+				if len(tuples) > 0 {
+					tuple[1] = tuples[len(tuples)-1][1]
+				}
+				tuples = append(tuples, tuple)
+			} else if ch == 1 {
+				tuples[len(tuples)-1][1] = value
+			}
+		}
+	}
+
+	return tuples
+}
+
 func main() {
-	// Example tuples (frequency, amplitude)
-	tuples := [][2]int{{440, 100}, {445, 105}, {450, 110}, {460, 120}, {470, 130}}
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run main.go path/to/wavfile")
+		return
+	}
+
+	filePath := os.Args[1]
+
+	// Read the WAV file
+	data, err := readWAVFile(filePath)
+	if err != nil {
+		fmt.Println("Error reading WAV file:", err)
+		return
+	}
+
+	// Parse the WAV header and fmt chunk
+	numChannels, bitsPerSample, sampleRate, dataSize, audioData, err := parseWAVHeader(data)
+	if err != nil {
+		fmt.Println("Error parsing WAV file:", err)
+		return
+	}
+
+	fmt.Printf("Number of Channels: %d\n", numChannels)
+	fmt.Printf("Bits per Sample: %d\n", bitsPerSample)
+	fmt.Printf("Sample Rate: %d\n", sampleRate)
+	fmt.Printf("Data Size: %d bytes\n", dataSize)
+
+	// Convert audio data to list of tuples (frequency, amplitude)
+	tuples := convertAudioToTuples(numChannels, bitsPerSample, audioData)
 
 	// Calculate original size
 	originalSize := len(tuples) * int(unsafe.Sizeof(tuples[0]))
@@ -169,12 +337,13 @@ func main() {
 
 	// Delta decode tuples
 	unpackedData := DeltaDecode(unpackedEncodedData)
+	_ = unpackedData
 
 	// Print results
-	fmt.Println("Original:", tuples)
+	// fmt.Println("Original:", tuples)
 	fmt.Printf("Original size: %d bytes\n", originalSize)
-	fmt.Println("Encoded:", encodedTuples)
+	// fmt.Println("Encoded:", encodedTuples)
 	fmt.Println("Huffman Encoded String Length:", len(encodedString))
 	fmt.Printf("Packed size: %d bytes (Compression ratio: %.2f)\n", packedSize, compressionRatio)
-	fmt.Println("Unpacked:", unpackedData)
+	// fmt.Println("Unpacked:", unpackedData)
 }
